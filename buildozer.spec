@@ -8,7 +8,7 @@ version = 0.1
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 
-icon.filename = icon.png
+icon.filename = Icon.png
 
 requirements = python3,kivy,plyer,numpy,matplotlib
 
