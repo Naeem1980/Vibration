@@ -1,0 +1,331 @@
+import time
+import os
+import threading
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.interpolate import CubicSpline
+from scipy.signal import butter, sosfiltfilt
+from scipy.integrate import cumulative_trapezoid
+from plyer import accelerometer
+
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+
+
+OUTPUT_FOLDER = "/storage/emulated/0/Pydroid3"
+
+RECORD_TIME = 10
+DEFAULT_TARGET_FS = 300
+MAX_RECOMMENDED_TARGET_FS = 300
+DEFAULT_HIGHPASS_CUTOFF = 5.0
+
+
+def estimate_requested_fs(target_fs):
+    calibration_target = np.array([10, 20, 50, 100, 150, 200, 250, 300])
+    calibration_request = np.array([10, 20, 50, 100, 150, 200, 400, 500])
+    return float(np.interp(target_fs, calibration_target, calibration_request))
+
+
+class PocketVibrationFFT(App):
+
+    def build(self):
+        self.timestamps = []
+        self.ax_data = []
+        self.ay_data = []
+        self.az_data = []
+
+        self.recording = False
+        self.sample_thread = None
+
+        layout = BoxLayout(orientation="vertical", padding=10, spacing=8)
+
+        self.status = Label(
+            text=(
+                "Pocket vibration estimator\n"
+                f"Max recommended FFT sample rate: {MAX_RECOMMENDED_TARGET_FS} Hz\n"
+                "Output: velocity spectrum in mm/s peak"
+            )
+        )
+
+        self.fs_input = TextInput(
+            text=str(DEFAULT_TARGET_FS),
+            multiline=False,
+            input_filter="float",
+            hint_text="Target sample rate / Hz"
+        )
+
+        self.cutoff_input = TextInput(
+            text=str(DEFAULT_HIGHPASS_CUTOFF),
+            multiline=False,
+            input_filter="float",
+            hint_text="High-pass cutoff / Hz"
+        )
+
+        self.start_button = Button(text="START RECORDING")
+        self.start_button.bind(on_press=self.start_recording)
+
+        self.fft_button = Button(text="CREATE FFT")
+        self.fft_button.bind(on_press=self.create_fft)
+
+        layout.add_widget(self.status)
+        layout.add_widget(Label(text="Target sample rate / Hz"))
+        layout.add_widget(self.fs_input)
+        layout.add_widget(Label(text="High-pass cutoff / Hz"))
+        layout.add_widget(self.cutoff_input)
+        layout.add_widget(self.start_button)
+        layout.add_widget(self.fft_button)
+
+        return layout
+
+    def start_recording(self, instance):
+        if self.recording:
+            self.status.text = "Already recording."
+            return
+
+        try:
+            target_fs = float(self.fs_input.text)
+            self.highpass_cutoff = float(self.cutoff_input.text)
+        except ValueError:
+            self.status.text = "Invalid input."
+            return
+
+        if target_fs > MAX_RECOMMENDED_TARGET_FS:
+            target_fs = MAX_RECOMMENDED_TARGET_FS
+            self.fs_input.text = str(MAX_RECOMMENDED_TARGET_FS)
+
+        if self.highpass_cutoff < 0.1:
+            self.highpass_cutoff = 0.1
+            self.cutoff_input.text = "0.1"
+
+        self.target_fs = target_fs
+        self.requested_fs = estimate_requested_fs(target_fs)
+        self.requested_dt = 1 / self.requested_fs
+
+        self.timestamps = []
+        self.ax_data = []
+        self.ay_data = []
+        self.az_data = []
+
+        try:
+            accelerometer.enable()
+        except Exception as e:
+            self.status.text = f"Could not enable accelerometer: {e}"
+            return
+
+        self.recording = True
+
+        self.status.text = (
+            f"Recording for {RECORD_TIME} s...\n"
+            f"Target fs: {target_fs:.0f} Hz\n"
+            f"Requested polling fs: {self.requested_fs:.0f} Hz\n"
+            f"High-pass cutoff: {self.highpass_cutoff:.1f} Hz"
+        )
+
+        self.sample_thread = threading.Thread(target=self.record_loop)
+        self.sample_thread.daemon = True
+        self.sample_thread.start()
+
+    def record_loop(self):
+        start_time = time.perf_counter()
+        last_ui_update = 0
+
+        while (time.perf_counter() - start_time) < RECORD_TIME:
+            elapsed = time.perf_counter() - start_time
+            accel = accelerometer.acceleration
+
+            if accel is not None:
+                ax, ay, az = accel
+                if ax is not None and ay is not None and az is not None:
+                    self.timestamps.append(elapsed)
+                    self.ax_data.append(ax)
+                    self.ay_data.append(ay)
+                    self.az_data.append(az)
+
+            if elapsed - last_ui_update > 0.5:
+                last_ui_update = elapsed
+                Clock.schedule_once(
+                    lambda dt, e=elapsed: self.update_recording_status(e),
+                    0
+                )
+
+            time.sleep(self.requested_dt)
+
+        accelerometer.disable()
+        self.recording = False
+        Clock.schedule_once(lambda dt: self.finish_recording_message(), 0)
+
+    def update_recording_status(self, elapsed):
+        self.status.text = (
+            f"Recording... {elapsed:.1f} / {RECORD_TIME} s\n"
+            f"Samples: {len(self.timestamps)}"
+        )
+
+    def finish_recording_message(self):
+        self.status.text = f"Recording complete. Samples: {len(self.timestamps)}"
+
+    def highpass_filter(self, signal, fs, cutoff_hz, order=4):
+        nyquist = fs / 2
+
+        if cutoff_hz >= nyquist * 0.8:
+            cutoff_hz = nyquist * 0.8
+
+        normal_cutoff = cutoff_hz / nyquist
+        sos = butter(order, normal_cutoff, btype="highpass", output="sos")
+        return sosfiltfilt(sos, signal)
+
+    def acceleration_to_velocity_mm_s(self, accel_signal, fs):
+        accel_signal = accel_signal - np.mean(accel_signal)
+
+        accel_signal = self.highpass_filter(
+            accel_signal,
+            fs,
+            self.highpass_cutoff
+        )
+
+        dt = 1 / fs
+
+        velocity_m_s = cumulative_trapezoid(
+            accel_signal,
+            dx=dt,
+            initial=0
+        )
+
+        velocity_m_s = velocity_m_s - np.mean(velocity_m_s)
+
+        velocity_m_s = self.highpass_filter(
+            velocity_m_s,
+            fs,
+            self.highpass_cutoff
+        )
+
+        velocity_mm_s = velocity_m_s * 1000
+
+        return velocity_mm_s
+
+    def calculate_velocity_fft(self, accel_signal, fs):
+        velocity_mm_s = self.acceleration_to_velocity_mm_s(accel_signal, fs)
+
+        n = len(velocity_mm_s)
+        window = np.hanning(n)
+        coherent_gain = np.sum(window) / n
+
+        velocity_windowed = velocity_mm_s * window
+
+        fft_values = np.fft.rfft(velocity_windowed)
+        freqs = np.fft.rfftfreq(n, d=1 / fs)
+
+        amplitude = np.abs(fft_values) / (n * coherent_gain)
+
+        if len(amplitude) > 2:
+            amplitude[1:-1] *= 2
+
+        amplitude[freqs < self.highpass_cutoff] = 0
+
+        return freqs, amplitude
+
+    def create_fft(self, instance):
+        if self.recording:
+            self.status.text = "Still recording. Wait until recording is complete."
+            return
+
+        if len(self.timestamps) < 20:
+            self.status.text = "Not enough data. Record first."
+            return
+
+        t_raw = np.array(self.timestamps)
+        ax_raw = np.array(self.ax_data)
+        ay_raw = np.array(self.ay_data)
+        az_raw = np.array(self.az_data)
+
+        dt_raw = np.diff(t_raw)
+        achieved_fs = 1 / np.mean(dt_raw)
+        max_gap = np.max(dt_raw)
+
+        resample_fs = min(self.target_fs, achieved_fs * 0.8)
+
+        if self.highpass_cutoff >= resample_fs / 2:
+            self.status.text = "High-pass cutoff is too high for sample rate."
+            return
+
+        unique_t, unique_indices = np.unique(t_raw, return_index=True)
+
+        t_raw = unique_t
+        ax_raw = ax_raw[unique_indices]
+        ay_raw = ay_raw[unique_indices]
+        az_raw = az_raw[unique_indices]
+
+        t_uniform = np.arange(0, t_raw[-1], 1 / resample_fs)
+
+        ax_uniform = CubicSpline(t_raw, ax_raw)(t_uniform)
+        ay_uniform = CubicSpline(t_raw, ay_raw)(t_uniform)
+        az_uniform = CubicSpline(t_raw, az_raw)(t_uniform)
+
+        freq_x, amp_x = self.calculate_velocity_fft(ax_uniform, resample_fs)
+        freq_y, amp_y = self.calculate_velocity_fft(ay_uniform, resample_fs)
+        freq_z, amp_z = self.calculate_velocity_fft(az_uniform, resample_fs)
+
+        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+        self.save_spectrum(
+            "velocity_fft_x_axis.png",
+            freq_x,
+            amp_x,
+            "X-axis Velocity Spectrum",
+            achieved_fs,
+            resample_fs,
+            max_gap
+        )
+
+        self.save_spectrum(
+            "velocity_fft_y_axis.png",
+            freq_y,
+            amp_y,
+            "Y-axis Velocity Spectrum",
+            achieved_fs,
+            resample_fs,
+            max_gap
+        )
+
+        self.save_spectrum(
+            "velocity_fft_z_axis.png",
+            freq_z,
+            amp_z,
+            "Z-axis Velocity Spectrum",
+            achieved_fs,
+            resample_fs,
+            max_gap
+        )
+
+        self.status.text = (
+            "FFT complete.\n"
+            f"Actual average sample rate: {achieved_fs:.1f} Hz\n"
+            f"FFT resample rate: {resample_fs:.1f} Hz\n"
+            f"High-pass cutoff: {self.highpass_cutoff:.1f} Hz\n"
+            f"Max dt gap: {max_gap * 1000:.1f} ms\n"
+            "Velocity spectra saved."
+        )
+
+    def save_spectrum(self, filename, freqs, amp, title, achieved_fs, resample_fs, max_gap):
+        plt.figure()
+        plt.plot(freqs, amp)
+        plt.title(
+            f"{title}\n"
+            f"Actual fs={achieved_fs:.1f} Hz, "
+            f"FFT fs={resample_fs:.1f} Hz, "
+            f"HP={self.highpass_cutoff:.1f} Hz, "
+            f"max dt={max_gap * 1000:.1f} ms"
+        )
+        plt.xlabel("Frequency / Hz")
+        plt.ylabel("Velocity amplitude / mm/s peak")
+        plt.grid(True)
+        plt.xlim(left=self.highpass_cutoff)
+        plt.savefig(f"{OUTPUT_FOLDER}/{filename}", dpi=150)
+        plt.close()
+
+
+PocketVibrationFFT().run()
