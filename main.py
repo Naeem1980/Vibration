@@ -4,9 +4,6 @@ import threading
 import numpy as np
 import matplotlib.pyplot as plt
 
-from scipy.interpolate import CubicSpline
-from scipy.signal import butter, sosfiltfilt
-from scipy.integrate import cumulative_trapezoid
 from plyer import accelerometer
 
 from kivy.app import App
@@ -136,10 +133,12 @@ class PocketVibrationFFT(App):
 
         while (time.perf_counter() - start_time) < RECORD_TIME:
             elapsed = time.perf_counter() - start_time
+
             accel = accelerometer.acceleration
 
             if accel is not None:
                 ax, ay, az = accel
+
                 if ax is not None and ay is not None and az is not None:
                     self.timestamps.append(elapsed)
                     self.ax_data.append(ax)
@@ -168,65 +167,34 @@ class PocketVibrationFFT(App):
     def finish_recording_message(self):
         self.status.text = f"Recording complete. Samples: {len(self.timestamps)}"
 
-    def highpass_filter(self, signal, fs, cutoff_hz, order=4):
-        nyquist = fs / 2
-
-        if cutoff_hz >= nyquist * 0.8:
-            cutoff_hz = nyquist * 0.8
-
-        normal_cutoff = cutoff_hz / nyquist
-        sos = butter(order, normal_cutoff, btype="highpass", output="sos")
-        return sosfiltfilt(sos, signal)
-
-    def acceleration_to_velocity_mm_s(self, accel_signal, fs):
+    def calculate_velocity_fft(self, accel_signal, fs):
         accel_signal = accel_signal - np.mean(accel_signal)
 
-        accel_signal = self.highpass_filter(
-            accel_signal,
-            fs,
-            self.highpass_cutoff
-        )
-
-        dt = 1 / fs
-
-        velocity_m_s = cumulative_trapezoid(
-            accel_signal,
-            dx=dt,
-            initial=0
-        )
-
-        velocity_m_s = velocity_m_s - np.mean(velocity_m_s)
-
-        velocity_m_s = self.highpass_filter(
-            velocity_m_s,
-            fs,
-            self.highpass_cutoff
-        )
-
-        velocity_mm_s = velocity_m_s * 1000
-
-        return velocity_mm_s
-
-    def calculate_velocity_fft(self, accel_signal, fs):
-        velocity_mm_s = self.acceleration_to_velocity_mm_s(accel_signal, fs)
-
-        n = len(velocity_mm_s)
+        n = len(accel_signal)
         window = np.hanning(n)
         coherent_gain = np.sum(window) / n
 
-        velocity_windowed = velocity_mm_s * window
+        accel_windowed = accel_signal * window
 
-        fft_values = np.fft.rfft(velocity_windowed)
+        accel_fft = np.fft.rfft(accel_windowed)
         freqs = np.fft.rfftfreq(n, d=1 / fs)
 
-        amplitude = np.abs(fft_values) / (n * coherent_gain)
+        velocity_fft = np.zeros_like(accel_fft, dtype=complex)
+
+        valid = freqs >= self.highpass_cutoff
+
+        velocity_fft[valid] = accel_fft[valid] / (1j * 2 * np.pi * freqs[valid])
+
+        amplitude = np.abs(velocity_fft) / (n * coherent_gain)
 
         if len(amplitude) > 2:
             amplitude[1:-1] *= 2
 
-        amplitude[freqs < self.highpass_cutoff] = 0
+        amplitude_mm_s = amplitude * 1000
 
-        return freqs, amplitude
+        amplitude_mm_s[freqs < self.highpass_cutoff] = 0
+
+        return freqs, amplitude_mm_s
 
     def create_fft(self, instance):
         if self.recording:
@@ -261,9 +229,9 @@ class PocketVibrationFFT(App):
 
         t_uniform = np.arange(0, t_raw[-1], 1 / resample_fs)
 
-        ax_uniform = CubicSpline(t_raw, ax_raw)(t_uniform)
-        ay_uniform = CubicSpline(t_raw, ay_raw)(t_uniform)
-        az_uniform = CubicSpline(t_raw, az_raw)(t_uniform)
+        ax_uniform = np.interp(t_uniform, t_raw, ax_raw)
+        ay_uniform = np.interp(t_uniform, t_raw, ay_raw)
+        az_uniform = np.interp(t_uniform, t_raw, az_raw)
 
         freq_x, amp_x = self.calculate_velocity_fft(ax_uniform, resample_fs)
         freq_y, amp_y = self.calculate_velocity_fft(ay_uniform, resample_fs)
