@@ -18,5 +18,6 @@ android.permissions = BODY_SENSORS,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 
 android.api = 35
 android.minapi = 23
+android.accept_sdk_license = True
 
 fullscreen = 0
