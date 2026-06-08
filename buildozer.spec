@@ -10,7 +10,7 @@ source.include_exts = py,png,jpg,kv,atlas
 
 icon.filename = icon.png
 
-requirements = python3,kivy,plyer,numpy,scipy,matplotlib
+requirements = python3,kivy,plyer,numpy,matplotlib
 
 orientation = portrait
 
