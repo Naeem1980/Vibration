@@ -3,6 +3,7 @@
 title = Vibrate Me
 package.name = vibrateme
 package.domain = org.naeem
+version = 0.1
 
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
