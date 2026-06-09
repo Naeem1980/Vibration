@@ -18,9 +18,15 @@ from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 
 
+from kivy.utils import platform
+
 if platform == "android":
-    from android.storage import app_storage_path
-    OUTPUT_FOLDER = app_storage_path()
+    from android.storage import primary_external_storage_path
+    OUTPUT_FOLDER = os.path.join(
+        primary_external_storage_path(),
+        "Download",
+        "VibrateMe"
+    )
 else:
     OUTPUT_FOLDER = "."
 
