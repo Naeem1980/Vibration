@@ -1,6 +1,9 @@
 import time
 import os
+import re
 import threading
+from datetime import datetime
+
 import numpy as np
 
 import matplotlib
@@ -17,8 +20,6 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 
-
-from kivy.utils import platform
 
 if platform == "android":
     from android.storage import primary_external_storage_path
@@ -43,6 +44,17 @@ def estimate_requested_fs(target_fs):
     return float(np.interp(target_fs, calibration_target, calibration_request))
 
 
+def safe_filename(text):
+    text = text.strip()
+
+    if text == "":
+        text = "Measurement"
+
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
+
+    return text
+
+
 class PocketVibrationFFT(App):
 
     def build(self):
@@ -62,6 +74,12 @@ class PocketVibrationFFT(App):
                 f"Max recommended FFT sample rate: {MAX_RECOMMENDED_TARGET_FS} Hz\n"
                 "Output: velocity spectrum in mm/s peak"
             )
+        )
+
+        self.name_input = TextInput(
+            text="Measurement",
+            multiline=False,
+            hint_text="Measurement name"
         )
 
         self.fs_input = TextInput(
@@ -85,6 +103,8 @@ class PocketVibrationFFT(App):
         self.fft_button.bind(on_press=self.create_fft)
 
         layout.add_widget(self.status)
+        layout.add_widget(Label(text="Measurement name"))
+        layout.add_widget(self.name_input)
         layout.add_widget(Label(text="Target sample rate / Hz"))
         layout.add_widget(self.fs_input)
         layout.add_widget(Label(text="High-pass cutoff / Hz"))
@@ -223,6 +243,10 @@ class PocketVibrationFFT(App):
             self.status.text = "Not enough data. Record first."
             return
 
+        measurement_name = safe_filename(self.name_input.text)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_prefix = f"{measurement_name}_{timestamp}"
+
         t_raw = np.array(self.timestamps)
         ax_raw = np.array(self.ax_data)
         ay_raw = np.array(self.ay_data)
@@ -258,7 +282,7 @@ class PocketVibrationFFT(App):
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
         self.save_spectrum(
-            "velocity_fft_x_axis.png",
+            f"{file_prefix}_FFT_X.png",
             freq_x,
             amp_x,
             "X-axis Velocity Spectrum",
@@ -268,7 +292,7 @@ class PocketVibrationFFT(App):
         )
 
         self.save_spectrum(
-            "velocity_fft_y_axis.png",
+            f"{file_prefix}_FFT_Y.png",
             freq_y,
             amp_y,
             "Y-axis Velocity Spectrum",
@@ -278,7 +302,7 @@ class PocketVibrationFFT(App):
         )
 
         self.save_spectrum(
-            "velocity_fft_z_axis.png",
+            f"{file_prefix}_FFT_Z.png",
             freq_z,
             amp_z,
             "Z-axis Velocity Spectrum",
@@ -292,7 +316,7 @@ class PocketVibrationFFT(App):
             f"Actual average sample rate: {achieved_fs:.1f} Hz\n"
             f"FFT resample rate: {resample_fs:.1f} Hz\n"
             f"High-pass cutoff: {self.highpass_cutoff:.1f} Hz\n"
-            f"Saved to:\n{OUTPUT_FOLDER}"
+            f"Saved as:\n{file_prefix}_FFT_X/Y/Z.png"
         )
 
     def save_spectrum(self, filename, freqs, amp, title, achieved_fs, resample_fs, max_gap):
