@@ -2,19 +2,28 @@ import time
 import os
 import threading
 import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from plyer import accelerometer
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.utils import platform
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 
 
-OUTPUT_FOLDER = "/storage/emulated/0/Pydroid3"
+if platform == "android":
+    from android.storage import app_storage_path
+    OUTPUT_FOLDER = app_storage_path()
+else:
+    OUTPUT_FOLDER = "."
+
 
 RECORD_TIME = 10
 DEFAULT_TARGET_FS = 300
@@ -133,7 +142,6 @@ class PocketVibrationFFT(App):
 
         while (time.perf_counter() - start_time) < RECORD_TIME:
             elapsed = time.perf_counter() - start_time
-
             accel = accelerometer.acceleration
 
             if accel is not None:
@@ -182,7 +190,6 @@ class PocketVibrationFFT(App):
         velocity_fft = np.zeros_like(accel_fft, dtype=complex)
 
         valid = freqs >= self.highpass_cutoff
-
         velocity_fft[valid] = accel_fft[valid] / (1j * 2 * np.pi * freqs[valid])
 
         amplitude = np.abs(velocity_fft) / (n * coherent_gain)
@@ -191,12 +198,17 @@ class PocketVibrationFFT(App):
             amplitude[1:-1] *= 2
 
         amplitude_mm_s = amplitude * 1000
-
         amplitude_mm_s[freqs < self.highpass_cutoff] = 0
 
         return freqs, amplitude_mm_s
 
     def create_fft(self, instance):
+        try:
+            self._create_fft()
+        except Exception as e:
+            self.status.text = f"FFT failed:\n{e}"
+
+    def _create_fft(self):
         if self.recording:
             self.status.text = "Still recording. Wait until recording is complete."
             return
@@ -274,11 +286,12 @@ class PocketVibrationFFT(App):
             f"Actual average sample rate: {achieved_fs:.1f} Hz\n"
             f"FFT resample rate: {resample_fs:.1f} Hz\n"
             f"High-pass cutoff: {self.highpass_cutoff:.1f} Hz\n"
-            f"Max dt gap: {max_gap * 1000:.1f} ms\n"
-            "Velocity spectra saved."
+            f"Saved to:\n{OUTPUT_FOLDER}"
         )
 
     def save_spectrum(self, filename, freqs, amp, title, achieved_fs, resample_fs, max_gap):
+        filepath = os.path.join(OUTPUT_FOLDER, filename)
+
         plt.figure()
         plt.plot(freqs, amp)
         plt.title(
@@ -292,7 +305,7 @@ class PocketVibrationFFT(App):
         plt.ylabel("Velocity amplitude / mm/s peak")
         plt.grid(True)
         plt.xlim(left=self.highpass_cutoff)
-        plt.savefig(f"{OUTPUT_FOLDER}/{filename}", dpi=150)
+        plt.savefig(filepath, dpi=150)
         plt.close()
 
 
