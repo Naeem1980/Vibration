@@ -32,7 +32,8 @@ else:
     OUTPUT_FOLDER = "."
 
 
-RECORD_TIME = 10
+DEFAULT_RECORD_TIME = 10.0
+DEFAULT_AVERAGES = 1
 DEFAULT_TARGET_FS = 300
 MAX_RECOMMENDED_TARGET_FS = 300
 DEFAULT_HIGHPASS_CUTOFF = 5.0
@@ -46,23 +47,15 @@ def estimate_requested_fs(target_fs):
 
 def safe_filename(text):
     text = text.strip()
-
     if text == "":
         text = "Measurement"
-
-    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
-
-    return text
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", text)
 
 
 class PocketVibrationFFT(App):
 
     def build(self):
-        self.timestamps = []
-        self.ax_data = []
-        self.ay_data = []
-        self.az_data = []
-
+        self.recordings = []
         self.recording = False
         self.sample_thread = None
 
@@ -72,7 +65,7 @@ class PocketVibrationFFT(App):
             text=(
                 "Pocket vibration estimator\n"
                 f"Max recommended FFT sample rate: {MAX_RECOMMENDED_TARGET_FS} Hz\n"
-                "Output: velocity spectrum in mm/s peak"
+                "Output: averaged velocity spectrum in mm/s peak"
             )
         )
 
@@ -96,6 +89,20 @@ class PocketVibrationFFT(App):
             hint_text="High-pass cutoff / Hz"
         )
 
+        self.record_time_input = TextInput(
+            text=str(DEFAULT_RECORD_TIME),
+            multiline=False,
+            input_filter="float",
+            hint_text="Recording length / s"
+        )
+
+        self.average_input = TextInput(
+            text=str(DEFAULT_AVERAGES),
+            multiline=False,
+            input_filter="int",
+            hint_text="Number of recordings to average"
+        )
+
         self.start_button = Button(text="START RECORDING")
         self.start_button.bind(on_press=self.start_recording)
 
@@ -103,12 +110,22 @@ class PocketVibrationFFT(App):
         self.fft_button.bind(on_press=self.create_fft)
 
         layout.add_widget(self.status)
+
         layout.add_widget(Label(text="Measurement name"))
         layout.add_widget(self.name_input)
+
         layout.add_widget(Label(text="Target sample rate / Hz"))
         layout.add_widget(self.fs_input)
+
         layout.add_widget(Label(text="High-pass cutoff / Hz"))
         layout.add_widget(self.cutoff_input)
+
+        layout.add_widget(Label(text="Recording length / s"))
+        layout.add_widget(self.record_time_input)
+
+        layout.add_widget(Label(text="Number of recordings to average"))
+        layout.add_widget(self.average_input)
+
         layout.add_widget(self.start_button)
         layout.add_widget(self.fft_button)
 
@@ -122,6 +139,8 @@ class PocketVibrationFFT(App):
         try:
             target_fs = float(self.fs_input.text)
             self.highpass_cutoff = float(self.cutoff_input.text)
+            self.record_time = float(self.record_time_input.text)
+            self.number_of_averages = int(self.average_input.text)
         except ValueError:
             self.status.text = "Invalid input."
             return
@@ -134,72 +153,105 @@ class PocketVibrationFFT(App):
             self.highpass_cutoff = 0.1
             self.cutoff_input.text = "0.1"
 
+        if self.record_time < 1.0:
+            self.record_time = 1.0
+            self.record_time_input.text = "1.0"
+
+        if self.number_of_averages < 1:
+            self.number_of_averages = 1
+            self.average_input.text = "1"
+
         self.target_fs = target_fs
         self.requested_fs = estimate_requested_fs(target_fs)
         self.requested_dt = 1 / self.requested_fs
 
-        self.timestamps = []
-        self.ax_data = []
-        self.ay_data = []
-        self.az_data = []
-
-        try:
-            accelerometer.enable()
-        except Exception as e:
-            self.status.text = f"Could not enable accelerometer: {e}"
-            return
-
+        self.recordings = []
         self.recording = True
 
-        self.status.text = (
-            f"Recording for {RECORD_TIME} s...\n"
-            f"Target fs: {target_fs:.0f} Hz\n"
-            f"Requested polling fs: {self.requested_fs:.0f} Hz\n"
-            f"High-pass cutoff: {self.highpass_cutoff:.1f} Hz"
-        )
-
-        self.sample_thread = threading.Thread(target=self.record_loop)
+        self.sample_thread = threading.Thread(target=self.recording_sequence)
         self.sample_thread.daemon = True
         self.sample_thread.start()
 
-    def record_loop(self):
-        start_time = time.perf_counter()
-        last_ui_update = 0
+    def recording_sequence(self):
+        try:
+            accelerometer.enable()
+        except Exception as e:
+            self.recording = False
+            Clock.schedule_once(
+                lambda dt: self.set_status(f"Could not enable accelerometer:\n{e}"),
+                0
+            )
+            return
 
-        while (time.perf_counter() - start_time) < RECORD_TIME:
-            elapsed = time.perf_counter() - start_time
-            accel = accelerometer.acceleration
+        for i in range(self.number_of_averages):
+            timestamps = []
+            ax_data = []
+            ay_data = []
+            az_data = []
 
-            if accel is not None:
-                ax, ay, az = accel
+            start_time = time.perf_counter()
+            last_ui_update = 0
 
-                if ax is not None and ay is not None and az is not None:
-                    self.timestamps.append(elapsed)
-                    self.ax_data.append(ax)
-                    self.ay_data.append(ay)
-                    self.az_data.append(az)
+            Clock.schedule_once(
+                lambda dt, n=i + 1: self.set_status(
+                    f"Recording {n} of {self.number_of_averages}..."
+                ),
+                0
+            )
 
-            if elapsed - last_ui_update > 0.5:
-                last_ui_update = elapsed
-                Clock.schedule_once(
-                    lambda dt, e=elapsed: self.update_recording_status(e),
-                    0
-                )
+            while (time.perf_counter() - start_time) < self.record_time:
+                elapsed = time.perf_counter() - start_time
+                accel = accelerometer.acceleration
 
-            time.sleep(self.requested_dt)
+                if accel is not None:
+                    ax, ay, az = accel
+
+                    if ax is not None and ay is not None and az is not None:
+                        timestamps.append(elapsed)
+                        ax_data.append(ax)
+                        ay_data.append(ay)
+                        az_data.append(az)
+
+                if elapsed - last_ui_update > 0.5:
+                    last_ui_update = elapsed
+                    Clock.schedule_once(
+                        lambda dt, e=elapsed, n=i + 1, s=len(timestamps):
+                        self.update_recording_status(e, n, s),
+                        0
+                    )
+
+                time.sleep(self.requested_dt)
+
+            self.recordings.append({
+                "t": np.array(timestamps),
+                "x": np.array(ax_data),
+                "y": np.array(ay_data),
+                "z": np.array(az_data),
+            })
+
+            time.sleep(0.25)
 
         accelerometer.disable()
         self.recording = False
-        Clock.schedule_once(lambda dt: self.finish_recording_message(), 0)
 
-    def update_recording_status(self, elapsed):
-        self.status.text = (
-            f"Recording... {elapsed:.1f} / {RECORD_TIME} s\n"
-            f"Samples: {len(self.timestamps)}"
+        Clock.schedule_once(
+            lambda dt: self.set_status(
+                f"Recording complete.\n"
+                f"Recordings collected: {len(self.recordings)}\n"
+                f"Press CREATE FFT."
+            ),
+            0
         )
 
-    def finish_recording_message(self):
-        self.status.text = f"Recording complete. Samples: {len(self.timestamps)}"
+    def set_status(self, text):
+        self.status.text = text
+
+    def update_recording_status(self, elapsed, recording_number, sample_count):
+        self.status.text = (
+            f"Recording {recording_number} of {self.number_of_averages}\n"
+            f"{elapsed:.1f} / {self.record_time:.1f} s\n"
+            f"Samples: {sample_count}"
+        )
 
     def calculate_velocity_fft(self, accel_signal, fs):
         accel_signal = accel_signal - np.mean(accel_signal)
@@ -239,82 +291,124 @@ class PocketVibrationFFT(App):
             self.status.text = "Still recording. Wait until recording is complete."
             return
 
-        if len(self.timestamps) < 20:
-            self.status.text = "Not enough data. Record first."
+        if len(self.recordings) < 1:
+            self.status.text = "No recordings found. Record first."
             return
 
         measurement_name = safe_filename(self.name_input.text)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_prefix = f"{measurement_name}_{timestamp}"
 
-        t_raw = np.array(self.timestamps)
-        ax_raw = np.array(self.ax_data)
-        ay_raw = np.array(self.ay_data)
-        az_raw = np.array(self.az_data)
+        all_amp_x = []
+        all_amp_y = []
+        all_amp_z = []
 
-        dt_raw = np.diff(t_raw)
-        achieved_fs = 1 / np.mean(dt_raw)
-        max_gap = np.max(dt_raw)
+        achieved_fs_list = []
+        max_gap_list = []
 
-        resample_fs = min(self.target_fs, achieved_fs * 0.8)
+        reference_freqs = None
+        resample_fs_list = []
 
-        if self.highpass_cutoff >= resample_fs / 2:
-            self.status.text = "High-pass cutoff is too high for sample rate."
+        for rec in self.recordings:
+            t_raw = rec["t"]
+            ax_raw = rec["x"]
+            ay_raw = rec["y"]
+            az_raw = rec["z"]
+
+            if len(t_raw) < 20:
+                continue
+
+            dt_raw = np.diff(t_raw)
+            achieved_fs = 1 / np.mean(dt_raw)
+            max_gap = np.max(dt_raw)
+
+            achieved_fs_list.append(achieved_fs)
+            max_gap_list.append(max_gap)
+
+            resample_fs = min(self.target_fs, achieved_fs * 0.8)
+            resample_fs_list.append(resample_fs)
+
+            if self.highpass_cutoff >= resample_fs / 2:
+                self.status.text = "High-pass cutoff is too high for sample rate."
+                return
+
+            unique_t, unique_indices = np.unique(t_raw, return_index=True)
+
+            t_raw = unique_t
+            ax_raw = ax_raw[unique_indices]
+            ay_raw = ay_raw[unique_indices]
+            az_raw = az_raw[unique_indices]
+
+            t_uniform = np.arange(0, t_raw[-1], 1 / resample_fs)
+
+            ax_uniform = np.interp(t_uniform, t_raw, ax_raw)
+            ay_uniform = np.interp(t_uniform, t_raw, ay_raw)
+            az_uniform = np.interp(t_uniform, t_raw, az_raw)
+
+            freq_x, amp_x = self.calculate_velocity_fft(ax_uniform, resample_fs)
+            freq_y, amp_y = self.calculate_velocity_fft(ay_uniform, resample_fs)
+            freq_z, amp_z = self.calculate_velocity_fft(az_uniform, resample_fs)
+
+            if reference_freqs is None:
+                reference_freqs = freq_x
+                all_amp_x.append(amp_x)
+                all_amp_y.append(amp_y)
+                all_amp_z.append(amp_z)
+            else:
+                all_amp_x.append(np.interp(reference_freqs, freq_x, amp_x))
+                all_amp_y.append(np.interp(reference_freqs, freq_y, amp_y))
+                all_amp_z.append(np.interp(reference_freqs, freq_z, amp_z))
+
+        if len(all_amp_x) == 0:
+            self.status.text = "No valid recordings for FFT."
             return
 
-        unique_t, unique_indices = np.unique(t_raw, return_index=True)
+        avg_amp_x = np.mean(np.array(all_amp_x), axis=0)
+        avg_amp_y = np.mean(np.array(all_amp_y), axis=0)
+        avg_amp_z = np.mean(np.array(all_amp_z), axis=0)
 
-        t_raw = unique_t
-        ax_raw = ax_raw[unique_indices]
-        ay_raw = ay_raw[unique_indices]
-        az_raw = az_raw[unique_indices]
-
-        t_uniform = np.arange(0, t_raw[-1], 1 / resample_fs)
-
-        ax_uniform = np.interp(t_uniform, t_raw, ax_raw)
-        ay_uniform = np.interp(t_uniform, t_raw, ay_raw)
-        az_uniform = np.interp(t_uniform, t_raw, az_raw)
-
-        freq_x, amp_x = self.calculate_velocity_fft(ax_uniform, resample_fs)
-        freq_y, amp_y = self.calculate_velocity_fft(ay_uniform, resample_fs)
-        freq_z, amp_z = self.calculate_velocity_fft(az_uniform, resample_fs)
+        avg_achieved_fs = float(np.mean(achieved_fs_list))
+        avg_resample_fs = float(np.mean(resample_fs_list))
+        max_gap = float(np.max(max_gap_list))
 
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
         self.save_spectrum(
             f"{file_prefix}_FFT_X.png",
-            freq_x,
-            amp_x,
+            reference_freqs,
+            avg_amp_x,
             "X-axis Velocity Spectrum",
-            achieved_fs,
-            resample_fs,
+            avg_achieved_fs,
+            avg_resample_fs,
             max_gap
         )
 
         self.save_spectrum(
             f"{file_prefix}_FFT_Y.png",
-            freq_y,
-            amp_y,
+            reference_freqs,
+            avg_amp_y,
             "Y-axis Velocity Spectrum",
-            achieved_fs,
-            resample_fs,
+            avg_achieved_fs,
+            avg_resample_fs,
             max_gap
         )
 
         self.save_spectrum(
             f"{file_prefix}_FFT_Z.png",
-            freq_z,
-            amp_z,
+            reference_freqs,
+            avg_amp_z,
             "Z-axis Velocity Spectrum",
-            achieved_fs,
-            resample_fs,
+            avg_achieved_fs,
+            avg_resample_fs,
             max_gap
         )
 
         self.status.text = (
             "FFT complete.\n"
-            f"Actual average sample rate: {achieved_fs:.1f} Hz\n"
-            f"FFT resample rate: {resample_fs:.1f} Hz\n"
+            f"Recordings averaged: {len(all_amp_x)}\n"
+            f"Recording length: {self.record_time:.1f} s\n"
+            f"Actual average sample rate: {avg_achieved_fs:.1f} Hz\n"
+            f"FFT resample rate: {avg_resample_fs:.1f} Hz\n"
             f"High-pass cutoff: {self.highpass_cutoff:.1f} Hz\n"
             f"Saved as:\n{file_prefix}_FFT_X/Y/Z.png"
         )
